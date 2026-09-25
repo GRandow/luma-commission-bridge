@@ -7,6 +7,7 @@ import { isPayable, resolveCommission } from "../domain/resolve-commission";
 import type { OrdersPaidPayload } from "../types/orders-paid";
 import type { AdminGraphql } from "./admin-graphql.server";
 import { findDistributorByCode, type Distributor } from "./distributors.server";
+import { enqueueCommissionSync } from "./commission-sync.server";
 import { jobQueue } from "./job-queue.server";
 import { writeCommissionToOrder } from "./order-writeback.server";
 import { markWebhookEvent } from "./webhook-events.server";
@@ -43,6 +44,9 @@ const defaultDeps: ProcessingDeps = {
  *    or a manual reprocess updates the same row instead of paying twice.
  * 4. Write metafields and a tag on the order. A failed write-back is
  *    recorded on the row and rethrown so the queue retries it.
+ * 5. Queue the hand-off to the commission engine as a separate job
+ *    (`commission-sync.server.ts`), so engine trouble never repeats
+ *    Shopify work.
  */
 export async function processPaidOrder(
   shop: string,
@@ -60,6 +64,7 @@ export async function processPaidOrder(
     ? await deps.findDistributorByCode(admin, referralCode)
     : null;
   const resolved = resolveCommission({ referralCode, distributor, baseCents });
+  const payable = isPayable(resolved.status);
 
   const values = {
     orderName: order.name,
@@ -72,6 +77,8 @@ export async function processPaidOrder(
     distributorName: resolved.distributorName,
     status: resolved.status,
     writebackError: null,
+    // Nothing to hand to the engine when the order pays no commission.
+    ...(payable ? {} : { syncStatus: "skipped" }),
     paidAt,
   };
   const commission = await prisma.commission.upsert({
@@ -80,7 +87,7 @@ export async function processPaidOrder(
     update: values,
   });
 
-  if (!isPayable(resolved.status) || !distributor) return commission;
+  if (!payable || !distributor) return commission;
 
   try {
     await deps.writeCommissionToOrder(admin, {
@@ -99,10 +106,12 @@ export async function processPaidOrder(
     throw error;
   }
 
-  return prisma.commission.update({
+  const written = await prisma.commission.update({
     where: { id: commission.id },
-    data: { status: "written_back" },
+    data: { status: "written_back", syncStatus: "pending" },
   });
+  void enqueueCommissionSync(written.id, order.name);
+  return written;
 }
 
 interface EnqueueInput {

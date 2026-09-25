@@ -68,6 +68,7 @@ model Commission {
   syncStatus      String    @default("pending")
   syncAttempts    Int       @default(0)
   syncError       String?
+  syncReference   String?
   syncedAt        DateTime?
   paidAt          DateTime
   createdAt       DateTime  @default(now())

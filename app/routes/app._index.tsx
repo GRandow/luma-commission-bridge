@@ -7,9 +7,13 @@ import type {
 import { useFetcher, useLoaderData, useRevalidator } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
+import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { formatRate } from "../domain/commission";
 import { formatCents } from "../domain/money";
+import { isPayable, type CommissionStatus } from "../domain/resolve-commission";
+import { getEngineConfig } from "../services/commission-engine.server";
+import { enqueueCommissionSync } from "../services/commission-sync.server";
 import {
   enqueueOrderProcessing,
   listCommissions,
@@ -25,6 +29,12 @@ import {
   listCommissionDefinitions,
 } from "../services/order-definitions.server";
 import { purgeOldWebhookEventsIfDue } from "../services/retention.server";
+import {
+  getSimulatedEngineMode,
+  isSimulatedEngineMode,
+  setSimulatedEngineMode,
+  type SimulatedEngineMode,
+} from "../services/simulated-engine.server";
 import {
   getWebhookEvent,
   listRecentWebhookEvents,
@@ -53,10 +63,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       }),
     ]);
 
+  const engine = getEngineConfig();
+  const engineUrl = new URL(engine.url, "http://localhost");
+  const simulated = engineUrl.pathname.startsWith("/simulated-engine/");
+  const urlMode = engineUrl.searchParams.get("mode");
+
   return {
     shop,
     summary,
     definitionsReady: definitionsReady(definitions),
+    engine: {
+      host: engineUrl.host,
+      path: engineUrl.pathname + engineUrl.search,
+      simulated,
+      // How the simulator answers: forced by the URL, or the switch on the page.
+      mode: urlMode ?? (simulated ? getSimulatedEngineMode() : null),
+      modeFromUrl: urlMode !== null,
+    },
     distributors: distributors?.map((distributor) => ({
       id: distributor.id,
       code: distributor.code,
@@ -76,6 +99,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       rate: formatRate(commission.rateBps),
       amount: formatCents(commission.amountCents, commission.orderCurrency),
       status: commission.status,
+      payable: isPayable(commission.status as CommissionStatus),
+      syncStatus: commission.syncStatus,
+      syncReference: commission.syncReference,
+      syncError: commission.syncError,
+      syncAttempts: commission.syncAttempts,
     })),
     events: events.map((event) => ({
       id: event.id,
@@ -87,6 +115,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     })),
   };
 };
+
+const simulatorModeMessage: Record<SimulatedEngineMode, string> = {
+  normal: "Simulator back to normal: it accepts commissions again.",
+  fail: "Simulator is down: syncs get a 503, retry with backoff, then fail.",
+  reject: "Simulator rejects commissions: syncs get a 422 and stop.",
+};
+
+const simulatorModes: Array<{ mode: SimulatedEngineMode; label: string }> = [
+  { mode: "normal", label: "Normal" },
+  { mode: "fail", label: "Outage (503)" },
+  { mode: "reject", label: "Rejecting (422)" },
+];
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session, admin } = await authenticate.admin(request);
@@ -127,6 +167,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  if (form.get("intent") === "retry-sync") {
+    const commissionId = String(form.get("commissionId") ?? "");
+    const commission = await prisma.commission.findUnique({
+      where: { id: commissionId },
+    });
+    if (!commission || commission.shop !== session.shop) {
+      return { ok: false, message: "That commission was not found." };
+    }
+    void enqueueCommissionSync(commission.id, commission.orderName);
+    return { ok: true, message: `Sync of ${commission.orderName} queued.` };
+  }
+
   if (form.get("intent") === "reprocess") {
     const webhookId = String(form.get("webhookId") ?? "");
     const event = await getWebhookEvent(webhookId);
@@ -139,6 +191,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     void enqueueOrderProcessing({ webhookId, shop: session.shop, order });
     return { ok: true, message: `Order ${order.name} queued again.` };
+  }
+
+  if (form.get("intent") === "engine-mode") {
+    const mode = form.get("mode");
+    if (!isSimulatedEngineMode(mode)) {
+      return { ok: false, message: "Unknown simulator mode." };
+    }
+    setSimulatedEngineMode(mode);
+    return { ok: true, message: simulatorModeMessage[mode] };
   }
 
   return { ok: false, message: "Unknown action." };
@@ -172,6 +233,14 @@ function commissionTone(
   }
 }
 
+const syncTone: Record<string, "success" | "warning" | "critical" | "neutral"> =
+  {
+    synced: "success",
+    pending: "warning",
+    failed: "critical",
+    skipped: "neutral",
+  };
+
 const statusLabel: Record<string, string> = {
   written_back: "on order",
   calculated: "calculated",
@@ -202,6 +271,7 @@ export default function Dashboard() {
     events,
     distributors,
     definitionsReady: definitionsAreReady,
+    engine,
   } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const revalidator = useRevalidator();
@@ -228,6 +298,10 @@ export default function Dashboard() {
     fetcher.submit({ intent: "seed-distributors" }, { method: "POST" });
   const setupDefinitions = () =>
     fetcher.submit({ intent: "setup-definitions" }, { method: "POST" });
+  const retrySync = (commissionId: string) =>
+    fetcher.submit({ intent: "retry-sync", commissionId }, { method: "POST" });
+  const setEngineMode = (mode: SimulatedEngineMode) =>
+    fetcher.submit({ intent: "engine-mode", mode }, { method: "POST" });
   const busy = fetcher.state !== "idle";
 
   return (
@@ -279,37 +353,55 @@ export default function Dashboard() {
           <s-table>
             <s-table-header-row>
               <s-table-header listSlot="primary">Order</s-table-header>
-              <s-table-header>Paid</s-table-header>
               <s-table-header>Distributor</s-table-header>
-              <s-table-header format="currency">Base</s-table-header>
-              <s-table-header format="numeric">Rate</s-table-header>
               <s-table-header format="currency">Commission</s-table-header>
               <s-table-header>Status</s-table-header>
+              <s-table-header>Engine</s-table-header>
             </s-table-header-row>
             <s-table-body>
               {commissions.map((commission) => (
                 <s-table-row key={commission.id}>
                   <s-table-cell>
-                    <s-link
-                      href={`shopify://admin/orders/${legacyId(commission.orderId)}`}
-                      target="_blank"
-                    >
-                      {commission.orderName}
-                    </s-link>
+                    <s-stack direction="block" gap="small-200">
+                      <s-link
+                        href={`shopify://admin/orders/${legacyId(commission.orderId)}`}
+                        target="_blank"
+                      >
+                        {commission.orderName}
+                      </s-link>
+                      <s-text color="subdued">
+                        {formatDate(commission.paidAt)}
+                      </s-text>
+                    </s-stack>
                   </s-table-cell>
-                  <s-table-cell>{formatDate(commission.paidAt)}</s-table-cell>
                   <s-table-cell>
                     {commission.distributorName ??
                       commission.referralCode ??
                       "—"}
                   </s-table-cell>
-                  <s-table-cell>{commission.base}</s-table-cell>
-                  <s-table-cell>{commission.rate}</s-table-cell>
-                  <s-table-cell>{commission.amount}</s-table-cell>
+                  <s-table-cell>
+                    <s-stack direction="block" gap="small-200" alignItems="end">
+                      <s-text>{commission.amount}</s-text>
+                      <s-text color="subdued">
+                        {commission.rate} of {commission.base}
+                      </s-text>
+                    </s-stack>
+                  </s-table-cell>
                   <s-table-cell>
                     <s-badge tone={commissionTone(commission.status)}>
                       {statusLabel[commission.status] ?? commission.status}
                     </s-badge>
+                  </s-table-cell>
+                  <s-table-cell>
+                    {commission.payable ? (
+                      <EngineCell
+                        commission={commission}
+                        busy={busy}
+                        onSync={() => retrySync(commission.id)}
+                      />
+                    ) : (
+                      <s-text color="subdued">—</s-text>
+                    )}
                   </s-table-cell>
                 </s-table-row>
               ))}
@@ -449,6 +541,60 @@ export default function Dashboard() {
         )}
       </s-section>
 
+      <s-section slot="aside" heading="Commission engine">
+        <s-paragraph>
+          {engine.simulated
+            ? "Built-in simulator (this app's own endpoint)."
+            : `External endpoint at ${engine.host}.`}
+        </s-paragraph>
+        <s-paragraph>
+          <s-text color="subdued">
+            {engine.host}
+            {engine.path}
+          </s-text>
+        </s-paragraph>
+        {engine.modeFromUrl ? (
+          <s-banner
+            tone="warning"
+            heading={`Mode "${engine.mode}" fixed by the URL`}
+          >
+            Set through <code>COMMISSION_ENGINE_URL</code>; remove{" "}
+            <code>?mode=</code> from it to switch modes from this page.
+          </s-banner>
+        ) : engine.simulated ? (
+          <s-stack direction="block" gap="base">
+            <s-paragraph>
+              Rehearse a failure: switch the simulator, place an order or click{" "}
+              <em>Sync</em>, watch the Engine column, then switch back and click{" "}
+              <em>Retry</em>.
+            </s-paragraph>
+            <s-stack direction="inline" gap="small">
+              {simulatorModes.map(({ mode, label }) => (
+                <s-button
+                  key={mode}
+                  variant={engine.mode === mode ? "primary" : "secondary"}
+                  onClick={() => setEngineMode(mode)}
+                  {...(busy ? { disabled: true } : {})}
+                >
+                  {label}
+                </s-button>
+              ))}
+            </s-stack>
+            {engine.mode === "fail" ? (
+              <s-banner tone="warning" heading="Simulating an outage">
+                Every sync gets a 503: the job retries with backoff and ends up
+                failed, with the reason and attempt count on the row.
+              </s-banner>
+            ) : engine.mode === "reject" ? (
+              <s-banner tone="critical" heading="Simulating rejections">
+                Every sync gets a 422: the job stops without retrying and waits
+                for someone to fix the cause and click Retry.
+              </s-banner>
+            ) : null}
+          </s-stack>
+        ) : null}
+      </s-section>
+
       <s-section slot="aside" heading="How it works">
         <s-unordered-list>
           <s-list-item>
@@ -468,7 +614,9 @@ export default function Dashboard() {
             on the order as metafields and a <code>ref:</code> tag.
           </s-list-item>
           <s-list-item>
-            Next: sync to the commission engine with retries and status.
+            Payable commissions are handed to the commission engine with an
+            idempotency key; outages retry with backoff, rejections stop and
+            wait for a person.
           </s-list-item>
         </s-unordered-list>
         <s-paragraph>
@@ -481,6 +629,50 @@ export default function Dashboard() {
         </s-paragraph>
       </s-section>
     </s-page>
+  );
+}
+
+interface EngineCellProps {
+  commission: {
+    syncStatus: string;
+    syncReference: string | null;
+    syncError: string | null;
+    syncAttempts: number;
+  };
+  busy: boolean;
+  onSync: () => void;
+}
+
+/** The hand-off to the engine: its state, the reference it gave, or why it failed. */
+function EngineCell({ commission, busy, onSync }: EngineCellProps) {
+  const failed = commission.syncStatus === "failed";
+  const attempts = commission.syncAttempts;
+  return (
+    <s-stack direction="block" gap="small-200">
+      <s-stack direction="inline" gap="small" alignItems="center">
+        <s-badge tone={syncTone[commission.syncStatus] ?? "neutral"}>
+          {commission.syncStatus}
+        </s-badge>
+        {failed || commission.syncStatus === "pending" ? (
+          <s-button
+            variant="tertiary"
+            onClick={onSync}
+            {...(busy ? { disabled: true } : {})}
+          >
+            {failed ? "Retry" : "Sync"}
+          </s-button>
+        ) : null}
+      </s-stack>
+      {commission.syncReference ? (
+        <s-text color="subdued">{commission.syncReference}</s-text>
+      ) : null}
+      {failed && commission.syncError ? (
+        <s-text color="subdued">
+          {commission.syncError} · after {attempts}{" "}
+          {attempts === 1 ? "attempt" : "attempts"}
+        </s-text>
+      ) : null}
+    </s-stack>
   );
 }
 

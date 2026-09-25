@@ -9,6 +9,10 @@ vi.mock("../db.server", () => ({
 vi.mock("../shopify.server", () => ({
   unauthenticated: { admin: vi.fn() },
 }));
+const enqueueCommissionSync = vi.fn().mockResolvedValue(undefined);
+vi.mock("./commission-sync.server", () => ({
+  enqueueCommissionSync: (...args: unknown[]) => enqueueCommissionSync(...args),
+}));
 
 const { processPaidOrder } = await import("./commissions.server");
 
@@ -52,6 +56,7 @@ function deps(overrides: Partial<Parameters<typeof processPaidOrder>[2]> = {}) {
 
 describe("processPaidOrder", () => {
   beforeEach(() => {
+    enqueueCommissionSync.mockClear();
     upsert
       .mockReset()
       .mockImplementation(({ create }) =>
@@ -96,6 +101,7 @@ describe("processPaidOrder", () => {
       distributorName: "Ana Souza",
     });
     expect(result.status).toBe("written_back");
+    expect(enqueueCommissionSync).toHaveBeenCalledWith("c1", "#1005");
   });
 
   it("stores an unattributed commission without touching the order", async () => {
@@ -109,8 +115,10 @@ describe("processPaidOrder", () => {
 
     expect(d.findDistributorByCode).not.toHaveBeenCalled();
     expect(d.writeCommissionToOrder).not.toHaveBeenCalled();
+    expect(enqueueCommissionSync).not.toHaveBeenCalled();
     expect(result.status).toBe("unattributed");
     expect(result.amountCents).toBe(420);
+    expect(result.syncStatus).toBe("skipped");
   });
 
   it("flags an unknown code and does not write it back", async () => {
