@@ -1,0 +1,33 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "b2072358393a79286319f8808acb513f"
+application_url = "https://example.com"
+embedded = true
+name = "luma-commission-bridge"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_orders,write_orders,read_metaobjects,write_metaobjects,read_customers"
+
+[webhooks]
+api_version = "2026-10"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
+
+  # Handled by: /app/routes/webhooks.orders.paid.tsx — the commission flow starts here
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/paid"
+  topics = [ "orders/paid" ]
+
+[auth]
+redirect_urls = [ "https://example.com/api/auth" ]
+
+[build]
+include_config_on_deploy = true
+automatically_update_urls_on_dev = true

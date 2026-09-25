@@ -1,0 +1,78 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Postgres (Neon in development and production): encrypted at rest and in
+// transit, which the app's protected-customer-data declaration relies on.
+// Tests never touch the database; the domain modules are pure.
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+/// One row per webhook delivery. The primary key is Shopify's webhook id, so a
+/// retried delivery cannot be processed twice.
+model WebhookEvent {
+  id          String    @id
+  shop        String
+  topic       String
+  status      String    @default("received")
+  attempts    Int       @default(0)
+  error       String?
+  payload     String
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([shop, receivedAt])
+}
+
+/// The commission calculated for one paid order. Money is integer cents and
+/// rates are basis points: no floating point anywhere near a payout.
+model Commission {
+  id              String    @id @default(cuid())
+  shop            String
+  orderId         String
+  orderName       String
+  orderCurrency   String
+  baseCents       Int
+  rateBps         Int
+  amountCents     Int
+  referralCode    String?
+  distributorId   String?
+  distributorName String?
+  status          String    @default("calculated")
+  writebackError  String?
+  syncStatus      String    @default("pending")
+  syncAttempts    Int       @default(0)
+  syncError       String?
+  syncedAt        DateTime?
+  paidAt          DateTime
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([shop, orderId])
+  @@index([shop, paidAt])
+}
