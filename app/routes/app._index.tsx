@@ -15,6 +15,15 @@ import {
   listCommissions,
   summarizeCommissions,
 } from "../services/commissions.server";
+import {
+  listDistributors,
+  seedSampleDistributors,
+} from "../services/distributors.server";
+import {
+  definitionsReady,
+  ensureCommissionDefinitions,
+  listCommissionDefinitions,
+} from "../services/order-definitions.server";
 import { purgeOldWebhookEventsIfDue } from "../services/retention.server";
 import {
   getWebhookEvent,
@@ -24,18 +33,38 @@ import {
 import type { OrdersPaidPayload } from "../types/orders-paid";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
   await purgeOldWebhookEventsIfDue();
-  const [commissions, events, summary] = await Promise.all([
-    listCommissions(shop),
-    listRecentWebhookEvents(shop),
-    summarizeCommissions(shop),
-  ]);
+  const [commissions, events, summary, distributors, definitions] =
+    await Promise.all([
+      listCommissions(shop),
+      listRecentWebhookEvents(shop),
+      summarizeCommissions(shop),
+      listDistributors(admin).catch((error: unknown) => {
+        // The metaobject definition is created by `shopify app deploy`/`dev`;
+        // until then the query fails and the section explains what to do.
+        console.error("[distributors] listing failed", error);
+        return null;
+      }),
+      listCommissionDefinitions(admin).catch((error: unknown) => {
+        console.error("[definitions] listing failed", error);
+        return [];
+      }),
+    ]);
 
   return {
     shop,
     summary,
+    definitionsReady: definitionsReady(definitions),
+    distributors: distributors?.map((distributor) => ({
+      id: distributor.id,
+      code: distributor.code,
+      name: distributor.name,
+      level: distributor.level,
+      rate: formatRate(distributor.rateBps),
+      active: distributor.active,
+    })),
     commissions: commissions.map((commission) => ({
       id: commission.id,
       orderId: commission.orderId,
@@ -60,8 +89,43 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const form = await request.formData();
+
+  if (form.get("intent") === "seed-distributors") {
+    try {
+      const created = await seedSampleDistributors(admin);
+      return {
+        ok: true,
+        message: `${created.length} sample distributors ready.`,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        message: `Could not create distributors: ${message}`,
+      };
+    }
+  }
+
+  if (form.get("intent") === "setup-definitions") {
+    try {
+      const { created, pinned } = await ensureCommissionDefinitions(admin);
+      return {
+        ok: true,
+        message:
+          created + pinned > 0
+            ? `Commission metafields ready (${created} created, ${pinned} pinned). Reprocess earlier orders to fill them in.`
+            : "Commission metafields were already set up.",
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        message: `Could not set up the metafields: ${message}`,
+      };
+    }
+  }
 
   if (form.get("intent") === "reprocess") {
     const webhookId = String(form.get("webhookId") ?? "");
@@ -92,11 +156,29 @@ const eventTone: Record<
   failed: "critical",
 };
 
-function commissionTone(status: string): "success" | "warning" | "info" {
-  if (status === "unattributed") return "warning";
-  if (status === "calculated") return "info";
-  return "success";
+function commissionTone(
+  status: string,
+): "success" | "warning" | "info" | "critical" {
+  switch (status) {
+    case "written_back":
+      return "success";
+    case "calculated":
+      return "info";
+    case "unknown_distributor":
+    case "inactive_distributor":
+      return "critical";
+    default:
+      return "warning";
+  }
 }
+
+const statusLabel: Record<string, string> = {
+  written_back: "on order",
+  calculated: "calculated",
+  unattributed: "no referral",
+  unknown_distributor: "unknown code",
+  inactive_distributor: "inactive distributor",
+};
 
 function formatDate(iso: string): string {
   return new Intl.DateTimeFormat("en-US", {
@@ -113,7 +195,14 @@ function legacyId(gid: string): string {
 }
 
 export default function Dashboard() {
-  const { shop, summary, commissions, events } = useLoaderData<typeof loader>();
+  const {
+    shop,
+    summary,
+    commissions,
+    events,
+    distributors,
+    definitionsReady: definitionsAreReady,
+  } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const revalidator = useRevalidator();
   const shopify = useAppBridge();
@@ -135,6 +224,11 @@ export default function Dashboard() {
 
   const reprocess = (webhookId: string) =>
     fetcher.submit({ intent: "reprocess", webhookId }, { method: "POST" });
+  const seedDistributors = () =>
+    fetcher.submit({ intent: "seed-distributors" }, { method: "POST" });
+  const setupDefinitions = () =>
+    fetcher.submit({ intent: "setup-definitions" }, { method: "POST" });
+  const busy = fetcher.state !== "idle";
 
   return (
     <s-page heading="Commission bridge">
@@ -160,6 +254,22 @@ export default function Dashboard() {
       </s-section>
 
       <s-section heading="Commissions">
+        {!definitionsAreReady ? (
+          <s-banner tone="info" heading="Show commissions on the order page">
+            <s-paragraph>
+              The app writes the commission on each attributed order as
+              metafields. Create its pinned metafield definitions once so the
+              admin shows them on every order page.
+            </s-paragraph>
+            <s-button
+              slot="secondary-actions"
+              onClick={setupDefinitions}
+              {...(busy ? { loading: true } : {})}
+            >
+              Set up order metafields
+            </s-button>
+          </s-banner>
+        ) : null}
         {commissions.length === 0 ? (
           <s-paragraph>
             No paid orders yet. Place a test order on the storefront with a{" "}
@@ -198,13 +308,94 @@ export default function Dashboard() {
                   <s-table-cell>{commission.amount}</s-table-cell>
                   <s-table-cell>
                     <s-badge tone={commissionTone(commission.status)}>
-                      {commission.status}
+                      {statusLabel[commission.status] ?? commission.status}
                     </s-badge>
                   </s-table-cell>
                 </s-table-row>
               ))}
             </s-table-body>
           </s-table>
+        )}
+      </s-section>
+
+      <s-section heading="Distributors">
+        <s-paragraph>
+          Distributors are metaobjects (<code>$app:distributor</code>): the
+          merchant manages them under Content → Metaobjects, no extra screen
+          needed. Each has a code, a level and their own commission rate.
+        </s-paragraph>
+        {distributors === undefined || distributors === null ? (
+          <s-banner tone="warning" heading="Distributor definition not found">
+            The metaobject definition is created from{" "}
+            <code>shopify.app.toml</code> when the app is deployed. Run{" "}
+            <code>shopify app deploy</code> (or restart{" "}
+            <code>shopify app dev</code>) and reload this page.
+          </s-banner>
+        ) : distributors.length === 0 ? (
+          <s-stack direction="block" gap="base">
+            <s-paragraph>
+              No distributors yet. Seed three sample ones to try the flow, or
+              add your own in the admin.
+            </s-paragraph>
+            <s-stack direction="inline" gap="base">
+              <s-button
+                onClick={seedDistributors}
+                {...(busy ? { loading: true } : {})}
+              >
+                Seed sample distributors
+              </s-button>
+              <s-link
+                href={`https://admin.shopify.com/store/${storeHandle}/content/metaobjects`}
+                target="_blank"
+              >
+                Open Content → Metaobjects
+              </s-link>
+            </s-stack>
+          </s-stack>
+        ) : (
+          <s-stack direction="block" gap="base">
+            <s-table>
+              <s-table-header-row>
+                <s-table-header listSlot="primary">Code</s-table-header>
+                <s-table-header>Name</s-table-header>
+                <s-table-header>Level</s-table-header>
+                <s-table-header format="numeric">Rate</s-table-header>
+                <s-table-header>Status</s-table-header>
+              </s-table-header-row>
+              <s-table-body>
+                {distributors.map((distributor) => (
+                  <s-table-row key={distributor.id}>
+                    <s-table-cell>{distributor.code}</s-table-cell>
+                    <s-table-cell>{distributor.name}</s-table-cell>
+                    <s-table-cell>{distributor.level ?? "—"}</s-table-cell>
+                    <s-table-cell>{distributor.rate}</s-table-cell>
+                    <s-table-cell>
+                      <s-badge
+                        tone={distributor.active ? "success" : "neutral"}
+                      >
+                        {distributor.active ? "active" : "inactive"}
+                      </s-badge>
+                    </s-table-cell>
+                  </s-table-row>
+                ))}
+              </s-table-body>
+            </s-table>
+            <s-paragraph>
+              Share a link such as{" "}
+              <code>
+                https://grandow.github.io/luma-shopify-storefront/?ref=
+                {distributors[0]?.code}
+              </code>{" "}
+              to attribute an order. Manage entries in{" "}
+              <s-link
+                href={`https://admin.shopify.com/store/${storeHandle}/content/metaobjects`}
+                target="_blank"
+              >
+                Content → Metaobjects
+              </s-link>
+              .
+            </s-paragraph>
+          </s-stack>
         )}
       </s-section>
 
@@ -246,7 +437,7 @@ export default function Dashboard() {
                     <s-button
                       variant="tertiary"
                       onClick={() => reprocess(event.id)}
-                      {...(fetcher.state !== "idle" ? { disabled: true } : {})}
+                      {...(busy ? { disabled: true } : {})}
                     >
                       Reprocess
                     </s-button>
@@ -273,8 +464,11 @@ export default function Dashboard() {
             the commission on the discounted subtotal.
           </s-list-item>
           <s-list-item>
-            Next: distributor metaobjects, write-back to the order and sync to
-            the commission engine.
+            The distributor&apos;s own rate applies; the commission is written
+            on the order as metafields and a <code>ref:</code> tag.
+          </s-list-item>
+          <s-list-item>
+            Next: sync to the commission engine with retries and status.
           </s-list-item>
         </s-unordered-list>
         <s-paragraph>

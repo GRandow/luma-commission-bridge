@@ -7,7 +7,44 @@ name = "luma-commission-bridge"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_orders,write_orders,read_metaobjects,write_metaobjects,read_customers"
+scopes = "read_orders,write_orders,write_metaobjects,write_metaobject_definitions,read_customers"
+
+# --- Custom data owned by the app (created by `shopify app deploy`) ---
+
+# Distributors: managed by the merchant in Content → Metaobjects, read by the app.
+[metaobjects.app.distributor]
+name = "Distributor"
+description = "A distributor who refers sales and earns a commission (Luma Commission Bridge)"
+
+  [metaobjects.app.distributor.access]
+  admin = "merchant_read_write"
+
+[metaobjects.app.distributor.fields.code]
+name = "Referral code"
+type = "single_line_text_field"
+required = true
+
+[metaobjects.app.distributor.fields.name]
+name = "Name"
+type = "single_line_text_field"
+required = true
+
+[metaobjects.app.distributor.fields.level]
+name = "Level"
+type = "single_line_text_field"
+
+[metaobjects.app.distributor.fields.commission_rate]
+name = "Commission rate (%)"
+type = "number_decimal"
+required = true
+
+[metaobjects.app.distributor.fields.active]
+name = "Active"
+type = "boolean"
+
+# The order metafield definitions the commission is written into are created by the
+# app itself (app/services/order-definitions.server.ts): declarative definitions cannot
+# be pinned, and only pinned definitions show on the order page.
 
 [webhooks]
 api_version = "2026-10"
@@ -29,5 +66,4 @@ api_version = "2026-10"
 redirect_urls = [ "https://example.com/api/auth" ]
 
 [build]
-include_config_on_deploy = true
 automatically_update_urls_on_dev = true

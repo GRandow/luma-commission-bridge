@@ -1,51 +1,107 @@
 import type { Commission } from "@prisma/client";
 import prisma from "../db.server";
+import { unauthenticated } from "../shopify.server";
 import { extractReferralCode } from "../domain/attribution";
-import { calculateCommission, DEFAULT_RATE_BPS } from "../domain/commission";
 import { parseMoneyToCents } from "../domain/money";
+import { isPayable, resolveCommission } from "../domain/resolve-commission";
 import type { OrdersPaidPayload } from "../types/orders-paid";
+import type { AdminGraphql } from "./admin-graphql.server";
+import { findDistributorByCode, type Distributor } from "./distributors.server";
 import { jobQueue } from "./job-queue.server";
+import { writeCommissionToOrder } from "./order-writeback.server";
 import { markWebhookEvent } from "./webhook-events.server";
 
 /**
- * Turns a paid order into a commission record. Runs from the job queue, not
- * from the webhook handler itself, so Shopify gets its 200 immediately.
+ * Everything the processing step talks to, injectable so the pipeline can
+ * be tested without Shopify or a database.
+ */
+export interface ProcessingDeps {
+  getAdmin: (shop: string) => Promise<AdminGraphql>;
+  findDistributorByCode: (
+    client: AdminGraphql,
+    code: string,
+  ) => Promise<Distributor | null>;
+  writeCommissionToOrder: typeof writeCommissionToOrder;
+}
+
+const defaultDeps: ProcessingDeps = {
+  getAdmin: async (shop) => (await unauthenticated.admin(shop)).admin,
+  findDistributorByCode,
+  writeCommissionToOrder,
+};
+
+/**
+ * Turns a paid order into a commission record and writes it back to the
+ * order. Runs from the job queue, not from the webhook handler, so Shopify
+ * gets its 200 immediately.
  *
- * Attribution comes from the `ref` note attribute the storefront put on the
- * cart. Orders without a usable code are kept as `unattributed` so the
- * merchant can see them instead of silently losing a sale. Recalculating an
- * order (a retried webhook, a manual reprocess) updates the same row: the
- * (shop, orderId) pair is unique.
+ * 1. Read the `ref` note attribute the storefront put on the cart.
+ * 2. Look the distributor up (a metaobject) and apply their rate; orders
+ *    with no code, an unknown code or an inactive distributor are kept with
+ *    a status that says so, never silently dropped.
+ * 3. Store the commission — unique per (shop, orderId), so a retried webhook
+ *    or a manual reprocess updates the same row instead of paying twice.
+ * 4. Write metafields and a tag on the order. A failed write-back is
+ *    recorded on the row and rethrown so the queue retries it.
  */
 export async function processPaidOrder(
   shop: string,
   order: OrdersPaidPayload,
+  deps: ProcessingDeps = defaultDeps,
 ): Promise<Commission> {
   const referralCode = extractReferralCode(order.note_attributes);
   const baseCents = parseMoneyToCents(
     order.current_subtotal_price ?? order.subtotal_price,
   );
-  const { rateBps, amountCents } = calculateCommission({
-    baseCents,
-    rateBps: DEFAULT_RATE_BPS,
-  });
   const paidAt = new Date(order.processed_at ?? order.created_at);
+
+  const admin = await deps.getAdmin(shop);
+  const distributor = referralCode
+    ? await deps.findDistributorByCode(admin, referralCode)
+    : null;
+  const resolved = resolveCommission({ referralCode, distributor, baseCents });
 
   const values = {
     orderName: order.name,
     orderCurrency: order.currency,
     baseCents,
-    rateBps,
-    amountCents,
+    rateBps: resolved.rateBps,
+    amountCents: resolved.amountCents,
     referralCode,
-    status: referralCode ? "calculated" : "unattributed",
+    distributorId: resolved.distributorId,
+    distributorName: resolved.distributorName,
+    status: resolved.status,
+    writebackError: null,
     paidAt,
   };
-
-  return prisma.commission.upsert({
+  const commission = await prisma.commission.upsert({
     where: { shop_orderId: { shop, orderId: order.admin_graphql_api_id } },
     create: { shop, orderId: order.admin_graphql_api_id, ...values },
     update: values,
+  });
+
+  if (!isPayable(resolved.status) || !distributor) return commission;
+
+  try {
+    await deps.writeCommissionToOrder(admin, {
+      orderId: order.admin_graphql_api_id,
+      amountCents: resolved.amountCents,
+      currency: order.currency,
+      rateBps: resolved.rateBps,
+      distributorCode: distributor.code,
+      distributorName: distributor.name,
+    });
+  } catch (error) {
+    await prisma.commission.update({
+      where: { id: commission.id },
+      data: { writebackError: describeError(error) },
+    });
+    throw error;
+  }
+
+  return prisma.commission.update({
+    where: { id: commission.id },
+    data: { status: "written_back" },
   });
 }
 
@@ -94,19 +150,23 @@ export function listCommissions(
 export interface CommissionSummary {
   orders: number;
   attributed: number;
-  /** Total commission per currency, in cents. */
+  /** Total payable commission per currency, in cents. */
   totals: Array<{ currency: string; amountCents: number }>;
 }
+
+const PAYABLE_STATUSES = ["calculated", "written_back"];
 
 export async function summarizeCommissions(
   shop: string,
 ): Promise<CommissionSummary> {
   const [orders, attributed, grouped] = await Promise.all([
     prisma.commission.count({ where: { shop } }),
-    prisma.commission.count({ where: { shop, referralCode: { not: null } } }),
+    prisma.commission.count({
+      where: { shop, status: { in: PAYABLE_STATUSES } },
+    }),
     prisma.commission.groupBy({
       by: ["orderCurrency"],
-      where: { shop, referralCode: { not: null } },
+      where: { shop, status: { in: PAYABLE_STATUSES } },
       _sum: { amountCents: true },
     }),
   ]);
