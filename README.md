@@ -39,6 +39,7 @@ storefront  /?ref=ANA123  →  cart attribute "ref"  →  Shopify checkout  → 
 - **The order is the ledger the merchant sees.** Attributed commissions are written back with one mutation: three app-owned order metafields (amount as `money`, distributor, rate) and a `ref:CODE` tag, so orders are filterable by distributor in the admin. A failed write-back is stored on the row and retried by the queue. The metafield definitions are created by the app through the API rather than declared in the TOML, because the order page only shows _pinned_ definitions and declarative ones cannot be pinned — a small thing that decides whether the merchant ever sees the commission.
 - **The engine is a contract, not a dependency.** `commission-engine.server.ts` knows one thing: POST a commission with a bearer token and an `Idempotency-Key`, get a reference back. In development the endpoint is the app's own simulator (`/simulated-engine/commissions`), which behaves like a real target — auth, deterministic references, and a switch on the dashboard (or `?mode=fail` / `?mode=reject` on the URL) to rehearse an outage or a bad payload without restarting anything. Pointing `COMMISSION_ENGINE_URL` at Exigo, ByDesign or a home-grown back office is a config change.
 - **Two kinds of failure, two behaviours.** A 5xx or a network error is retried with exponential backoff; a 4xx means the payload is the problem, so the sync stops, the reason is shown on the dashboard, and a person decides (there is a _Retry_ button once the cause is fixed). Every attempt is counted on the row.
+- **The dashboard survives a flaky path.** A dev tunnel drops requests now and then, and a page that polls every five seconds meets every drop. The live parts (orders, jobs, syncs) are polled as JSON with a plain `fetch`, so a failed poll keeps the last good data on screen; a request that dies in transit (5xx, timeout, DNS) shows "Reconnecting" and reloads itself; and a refusal (401, 403) is shown with its status and likely cause instead of a blank error. Auth redirects still go through Shopify's own boundary.
 - **Queue in process, on purpose.** One dev store, one Node process: an in-process queue is enough and keeps the demo self-contained. The queue has a tiny interface so SQS or BullMQ can replace it without touching the handlers; persisted deliveries already make unfinished work re-runnable after a restart.
 
 ## Stack
@@ -56,9 +57,13 @@ app/
 │                   commission-engine.server.ts (client) · commission-sync.server.ts (sync job) · simulated-engine.server.ts
 │                   order-definitions.server.ts (creates the app's pinned order metafield definitions)
 │                   retention.server.ts (30-day purge of payloads, delete-everything on uninstall)
+│                   dashboard.server.ts (the live part of the dashboard, shared by the page and its JSON poll)
+├─ components/      RouteErrorBoundary.tsx — reconnect on transport failures, explain refusals
+├─ utils/           route-errors.ts — which route errors are transient
 ├─ routes/
 │  ├─ webhooks.orders.paid.tsx   verify → record → enqueue → 200
 │  ├─ simulated-engine.commissions.tsx   the stand-in commission engine (bearer auth, JSON)
+│  ├─ app.activity.tsx           JSON the dashboard polls (orders, jobs, syncs)
 │  ├─ app._index.tsx             dashboard (loader/action, Polaris web components)
 │  └─ webhooks.app.*.tsx         template lifecycle webhooks
 ├─ types/           orders-paid.ts — the slice of the webhook payload we depend on

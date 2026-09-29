@@ -1,24 +1,24 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type {
   ActionFunctionArgs,
   HeadersFunction,
   LoaderFunctionArgs,
 } from "react-router";
-import { useFetcher, useLoaderData, useRevalidator } from "react-router";
+import { useFetcher, useLoaderData, useRouteError } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
+import { RouteErrorBoundary } from "../components/RouteErrorBoundary";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { formatRate } from "../domain/commission";
 import { formatCents } from "../domain/money";
-import { isPayable, type CommissionStatus } from "../domain/resolve-commission";
 import { getEngineConfig } from "../services/commission-engine.server";
 import { enqueueCommissionSync } from "../services/commission-sync.server";
+import { enqueueOrderProcessing } from "../services/commissions.server";
 import {
-  enqueueOrderProcessing,
-  listCommissions,
-  summarizeCommissions,
-} from "../services/commissions.server";
+  loadDashboardActivity,
+  type DashboardActivity,
+} from "../services/dashboard.server";
 import {
   listDistributors,
   seedSampleDistributors,
@@ -37,31 +37,30 @@ import {
 } from "../services/simulated-engine.server";
 import {
   getWebhookEvent,
-  listRecentWebhookEvents,
   parseStoredPayload,
 } from "../services/webhook-events.server";
 import type { OrdersPaidPayload } from "../types/orders-paid";
+
+/** How often the page asks `/app/activity` for new orders and sync results. */
+const ACTIVITY_POLL_MS = 5000;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
   await purgeOldWebhookEventsIfDue();
-  const [commissions, events, summary, distributors, definitions] =
-    await Promise.all([
-      listCommissions(shop),
-      listRecentWebhookEvents(shop),
-      summarizeCommissions(shop),
-      listDistributors(admin).catch((error: unknown) => {
-        // The metaobject definition is created by `shopify app deploy`/`dev`;
-        // until then the query fails and the section explains what to do.
-        console.error("[distributors] listing failed", error);
-        return null;
-      }),
-      listCommissionDefinitions(admin).catch((error: unknown) => {
-        console.error("[definitions] listing failed", error);
-        return [];
-      }),
-    ]);
+  const [activity, distributors, definitions] = await Promise.all([
+    loadDashboardActivity(shop),
+    listDistributors(admin).catch((error: unknown) => {
+      // The metaobject definition is created by `shopify app deploy`/`dev`;
+      // until then the query fails and the section explains what to do.
+      console.error("[distributors] listing failed", error);
+      return null;
+    }),
+    listCommissionDefinitions(admin).catch((error: unknown) => {
+      console.error("[definitions] listing failed", error);
+      return [];
+    }),
+  ]);
 
   const engine = getEngineConfig();
   const engineUrl = new URL(engine.url, "http://localhost");
@@ -70,7 +69,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   return {
     shop,
-    summary,
+    activity,
     definitionsReady: definitionsReady(definitions),
     engine: {
       host: engineUrl.host,
@@ -87,31 +86,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       level: distributor.level,
       rate: formatRate(distributor.rateBps),
       active: distributor.active,
-    })),
-    commissions: commissions.map((commission) => ({
-      id: commission.id,
-      orderId: commission.orderId,
-      orderName: commission.orderName,
-      paidAt: commission.paidAt.toISOString(),
-      referralCode: commission.referralCode,
-      distributorName: commission.distributorName,
-      base: formatCents(commission.baseCents, commission.orderCurrency),
-      rate: formatRate(commission.rateBps),
-      amount: formatCents(commission.amountCents, commission.orderCurrency),
-      status: commission.status,
-      payable: isPayable(commission.status as CommissionStatus),
-      syncStatus: commission.syncStatus,
-      syncReference: commission.syncReference,
-      syncError: commission.syncError,
-      syncAttempts: commission.syncAttempts,
-    })),
-    events: events.map((event) => ({
-      id: event.id,
-      topic: event.topic,
-      status: event.status,
-      attempts: event.attempts,
-      error: event.error,
-      receivedAt: event.receivedAt.toISOString(),
     })),
   };
 };
@@ -266,31 +240,22 @@ function legacyId(gid: string): string {
 export default function Dashboard() {
   const {
     shop,
-    summary,
-    commissions,
-    events,
+    activity: loadedActivity,
     distributors,
     definitionsReady: definitionsAreReady,
     engine,
   } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
-  const revalidator = useRevalidator();
   const shopify = useAppBridge();
   const storeHandle = shop.replace(".myshopify.com", "");
+  const { activity, stale } = useLiveActivity(loadedActivity);
+  const { summary, commissions, events } = activity;
 
   useEffect(() => {
     if (fetcher.data?.message) {
       shopify.toast.show(fetcher.data.message, { isError: !fetcher.data.ok });
     }
   }, [fetcher.data, shopify]);
-
-  // Webhooks arrive while the page is open; keep the tables fresh without a reload.
-  useEffect(() => {
-    const timer = setInterval(() => {
-      if (revalidator.state === "idle") revalidator.revalidate();
-    }, 5000);
-    return () => clearInterval(timer);
-  }, [revalidator]);
 
   const reprocess = (webhookId: string) =>
     fetcher.submit({ intent: "reprocess", webhookId }, { method: "POST" });
@@ -328,6 +293,13 @@ export default function Dashboard() {
       </s-section>
 
       <s-section heading="Commissions">
+        {stale ? (
+          <s-paragraph>
+            <s-text color="subdued">
+              Reconnecting to the app server; showing the last data received.
+            </s-text>
+          </s-paragraph>
+        ) : null}
         {!definitionsAreReady ? (
           <s-banner tone="info" heading="Show commissions on the order page">
             <s-paragraph>
@@ -674,6 +646,57 @@ function EngineCell({ commission, busy, onSync }: EngineCellProps) {
       ) : null}
     </s-stack>
   );
+}
+
+/**
+ * Keeps the activity (orders, jobs, syncs) fresh while the page is open.
+ * Polls a JSON route with plain fetch rather than revalidating the loader,
+ * so a poll that fails in transit keeps the last good data on screen; the
+ * loader's data still wins whenever an action makes React Router reload it.
+ */
+function useLiveActivity(loaded: DashboardActivity) {
+  const [activity, setActivity] = useState(loaded);
+  const [stale, setStale] = useState(false);
+
+  useEffect(() => {
+    setActivity(loaded);
+    setStale(false);
+  }, [loaded]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    const tick = async () => {
+      if (inFlight || document.hidden) return;
+      inFlight = true;
+      try {
+        const response = await fetch("/app/activity", {
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const next = (await response.json()) as DashboardActivity;
+        if (!cancelled) {
+          setActivity(next);
+          setStale(false);
+        }
+      } catch {
+        if (!cancelled) setStale(true);
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = setInterval(() => void tick(), ACTIVITY_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  return { activity, stale };
+}
+
+export function ErrorBoundary() {
+  return <RouteErrorBoundary error={useRouteError()} />;
 }
 
 function Stat({ label, value }: { label: string; value: string }) {
