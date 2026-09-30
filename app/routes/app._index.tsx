@@ -7,6 +7,8 @@ import type {
 import { useFetcher, useLoaderData, useRouteError } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
+import { CommissionsTable } from "../components/CommissionsTable";
+import { DeliveriesTable } from "../components/DeliveriesTable";
 import { RouteErrorBoundary } from "../components/RouteErrorBoundary";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
@@ -189,64 +191,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return { ok: false, message: "Unknown action." };
 };
 
-type EventStatus = "received" | "processing" | "processed" | "failed";
-
-const eventTone: Record<
-  EventStatus,
-  "info" | "success" | "critical" | "warning"
-> = {
-  received: "info",
-  processing: "warning",
-  processed: "success",
-  failed: "critical",
-};
-
-function commissionTone(
-  status: string,
-): "success" | "warning" | "info" | "critical" {
-  switch (status) {
-    case "written_back":
-      return "success";
-    case "calculated":
-      return "info";
-    case "unknown_distributor":
-    case "inactive_distributor":
-      return "critical";
-    default:
-      return "warning";
-  }
-}
-
-const syncTone: Record<string, "success" | "warning" | "critical" | "neutral"> =
-  {
-    synced: "success",
-    pending: "warning",
-    failed: "critical",
-    skipped: "neutral",
-  };
-
-const statusLabel: Record<string, string> = {
-  written_back: "on order",
-  calculated: "calculated",
-  unattributed: "no referral",
-  unknown_distributor: "unknown code",
-  inactive_distributor: "inactive distributor",
-};
-
-function formatDate(iso: string): string {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(new Date(iso));
-}
-
-/** `gid://shopify/Order/123` → `123`, the admin URL id. */
-function legacyId(gid: string): string {
-  return gid.split("/").pop() ?? gid;
-}
-
 export default function Dashboard() {
   const {
     shop,
@@ -259,7 +203,7 @@ export default function Dashboard() {
   const shopify = useAppBridge();
   const storeHandle = shop.replace(".myshopify.com", "");
   const { activity, stale } = useLiveActivity(loadedActivity);
-  const { summary, commissions, events } = activity;
+  const { summary, commissions, events, eventCount } = activity;
 
   useEffect(() => {
     if (fetcher.data?.message) {
@@ -332,63 +276,21 @@ export default function Dashboard() {
             <code>?ref=CODE</code> link and it will appear here within seconds.
           </s-paragraph>
         ) : (
-          <s-table>
-            <s-table-header-row>
-              <s-table-header listSlot="primary">Order</s-table-header>
-              <s-table-header>Distributor</s-table-header>
-              <s-table-header format="currency">Commission</s-table-header>
-              <s-table-header>Status</s-table-header>
-              <s-table-header>Engine</s-table-header>
-            </s-table-header-row>
-            <s-table-body>
-              {commissions.map((commission) => (
-                <s-table-row key={commission.id}>
-                  <s-table-cell>
-                    <s-stack direction="block" gap="small-200">
-                      <s-link
-                        href={`shopify://admin/orders/${legacyId(commission.orderId)}`}
-                        target="_blank"
-                      >
-                        {commission.orderName}
-                      </s-link>
-                      <s-text color="subdued">
-                        {formatDate(commission.paidAt)}
-                      </s-text>
-                    </s-stack>
-                  </s-table-cell>
-                  <s-table-cell>
-                    {commission.distributorName ??
-                      commission.referralCode ??
-                      "—"}
-                  </s-table-cell>
-                  <s-table-cell>
-                    <s-stack direction="block" gap="small-200" alignItems="end">
-                      <s-text>{commission.amount}</s-text>
-                      <s-text color="subdued">
-                        {commission.rate} of {commission.base}
-                      </s-text>
-                    </s-stack>
-                  </s-table-cell>
-                  <s-table-cell>
-                    <s-badge tone={commissionTone(commission.status)}>
-                      {statusLabel[commission.status] ?? commission.status}
-                    </s-badge>
-                  </s-table-cell>
-                  <s-table-cell>
-                    {commission.payable ? (
-                      <EngineCell
-                        commission={commission}
-                        busy={busy}
-                        onSync={() => retrySync(commission.id)}
-                      />
-                    ) : (
-                      <s-text color="subdued">—</s-text>
-                    )}
-                  </s-table-cell>
-                </s-table-row>
-              ))}
-            </s-table-body>
-          </s-table>
+          <s-stack direction="block" gap="base">
+            <CommissionsTable
+              rows={commissions}
+              busy={busy}
+              onSync={retrySync}
+            />
+            <s-paragraph>
+              {summary.orders > commissions.length ? (
+                <s-text color="subdued">
+                  Latest {commissions.length} of {summary.orders}.{" "}
+                </s-text>
+              ) : null}
+              <s-link href="/app/commissions">View all commissions</s-link>
+            </s-paragraph>
+          </s-stack>
         )}
       </s-section>
 
@@ -483,43 +385,21 @@ export default function Dashboard() {
         {events.length === 0 ? (
           <s-paragraph>Nothing received yet.</s-paragraph>
         ) : (
-          <s-table>
-            <s-table-header-row>
-              <s-table-header listSlot="primary">Received</s-table-header>
-              <s-table-header>Topic</s-table-header>
-              <s-table-header>Status</s-table-header>
-              <s-table-header>Details</s-table-header>
-              <s-table-header></s-table-header>
-            </s-table-header-row>
-            <s-table-body>
-              {events.map((event) => (
-                <s-table-row key={event.id}>
-                  <s-table-cell>{formatDate(event.receivedAt)}</s-table-cell>
-                  <s-table-cell>{event.topic}</s-table-cell>
-                  <s-table-cell>
-                    <s-badge
-                      tone={eventTone[event.status as EventStatus] ?? "info"}
-                    >
-                      {event.status}
-                    </s-badge>
-                  </s-table-cell>
-                  <s-table-cell>
-                    {event.error ??
-                      (event.attempts > 1 ? `${event.attempts} attempts` : "")}
-                  </s-table-cell>
-                  <s-table-cell>
-                    <s-button
-                      variant="tertiary"
-                      onClick={() => reprocess(event.id)}
-                      {...(busy ? { disabled: true } : {})}
-                    >
-                      Reprocess
-                    </s-button>
-                  </s-table-cell>
-                </s-table-row>
-              ))}
-            </s-table-body>
-          </s-table>
+          <s-stack direction="block" gap="base">
+            <DeliveriesTable
+              rows={events}
+              busy={busy}
+              onReprocess={reprocess}
+            />
+            <s-paragraph>
+              {eventCount > events.length ? (
+                <s-text color="subdued">
+                  Latest {events.length} of {eventCount}.{" "}
+                </s-text>
+              ) : null}
+              <s-link href="/app/deliveries">View all deliveries</s-link>
+            </s-paragraph>
+          </s-stack>
         )}
       </s-section>
 
@@ -611,50 +491,6 @@ export default function Dashboard() {
         </s-paragraph>
       </s-section>
     </s-page>
-  );
-}
-
-interface EngineCellProps {
-  commission: {
-    syncStatus: string;
-    syncReference: string | null;
-    syncError: string | null;
-    syncAttempts: number;
-  };
-  busy: boolean;
-  onSync: () => void;
-}
-
-/** The hand-off to the engine: its state, the reference it gave, or why it failed. */
-function EngineCell({ commission, busy, onSync }: EngineCellProps) {
-  const failed = commission.syncStatus === "failed";
-  const attempts = commission.syncAttempts;
-  return (
-    <s-stack direction="block" gap="small-200">
-      <s-stack direction="inline" gap="small" alignItems="center">
-        <s-badge tone={syncTone[commission.syncStatus] ?? "neutral"}>
-          {commission.syncStatus}
-        </s-badge>
-        {failed || commission.syncStatus === "pending" ? (
-          <s-button
-            variant="tertiary"
-            onClick={onSync}
-            {...(busy ? { disabled: true } : {})}
-          >
-            {failed ? "Retry" : "Sync"}
-          </s-button>
-        ) : null}
-      </s-stack>
-      {commission.syncReference ? (
-        <s-text color="subdued">{commission.syncReference}</s-text>
-      ) : null}
-      {failed && commission.syncError ? (
-        <s-text color="subdued">
-          {commission.syncError} · after {attempts}{" "}
-          {attempts === 1 ? "attempt" : "attempts"}
-        </s-text>
-      ) : null}
-    </s-stack>
   );
 }
 

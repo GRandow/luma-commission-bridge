@@ -44,6 +44,7 @@ checkout    code typed in the checkout UI extension  ─┘
 - **The engine is a contract, not a dependency.** `commission-engine.server.ts` knows one thing: POST a commission with a bearer token and an `Idempotency-Key`, get a reference back. In development the endpoint is the app's own simulator (`/simulated-engine/commissions`), which behaves like a real target — auth, deterministic references, and a switch on the dashboard (or `?mode=fail` / `?mode=reject` on the URL) to rehearse an outage or a bad payload without restarting anything. Pointing `COMMISSION_ENGINE_URL` at Exigo, ByDesign or a home-grown back office is a config change.
 - **Two kinds of failure, two behaviours.** A 5xx or a network error is retried with exponential backoff; a 4xx means the payload is the problem, so the sync stops, the reason is shown on the dashboard, and a person decides (there is a _Retry_ button once the cause is fixed). Every attempt is counted on the row.
 - **The dashboard survives a flaky path.** A dev tunnel drops requests now and then, and a page that polls every five seconds meets every drop. The live parts (orders, jobs, syncs) are polled as JSON with a plain `fetch`, so a failed poll keeps the last good data on screen; a request that dies in transit (5xx, timeout, DNS) shows "Reconnecting" and reloads itself; and a refusal (401, 403) is shown with its status and likely cause instead of a blank error. Auth redirects still go through Shopify's own boundary.
+- **The overview stays short; the ledger has its own pages.** A real store's tables only grow, so the dashboard shows the latest eight commissions and five deliveries and links to full pages (`/app/commissions`, `/app/deliveries`) that are paged from the database, 15 rows at a time, newest first. The commissions page can be narrowed to one engine state (_Failed_ is the one an operator reaches for) and searched by distributor name, referral code or order number as you type; both live in the URL, so a filtered view can be shared. Retry, Sync and Reprocess work from every page; they post to the same action, so the behaviour cannot drift between the overview and the full list.
 - **Queue in process, on purpose.** One dev store, one Node process: an in-process queue is enough and keeps the demo self-contained. The queue has a tiny interface so SQS or BullMQ can replace it without touching the handlers; persisted deliveries already make unfinished work re-runnable after a restart.
 
 ## Stack
@@ -55,22 +56,25 @@ React Router 7 (server and admin UI in one project) · `@shopify/shopify-app-rea
 ```
 app/
 ├─ domain/          money.ts (cents) · rates.ts (basis points) · attribution.ts (referral code) · commission.ts
-│                   resolve-commission.ts (which rate and status apply) — pure, unit-tested
+│                   resolve-commission.ts (which rate and status apply) · paging.ts (page size, clamping, filters) — pure, unit-tested
 ├─ services/        job-queue.server.ts · webhook-events.server.ts (idempotent intake) · commissions.server.ts (pipeline)
 │                   distributors.server.ts (metaobjects) · order-writeback.server.ts (metafieldsSet + tagsAdd)
 │                   commission-engine.server.ts (client) · commission-sync.server.ts (sync job) · simulated-engine.server.ts
 │                   order-definitions.server.ts (creates the app's pinned order metafield definitions)
 │                   retention.server.ts (30-day purge of payloads, delete-everything on uninstall)
-│                   dashboard.server.ts (the live part of the dashboard, shared by the page and its JSON poll)
+│                   dashboard.server.ts (the overview's latest rows, shared with its JSON poll · the paged full tables)
 │                   referral-validation.server.ts (code → active distributor?) · checkout-config.server.ts (the app's URL, as a shop metafield)
-├─ components/      RouteErrorBoundary.tsx — reconnect on transport failures, explain refusals
+├─ components/      CommissionsTable.tsx · DeliveriesTable.tsx · Pagination.tsx · NoWrap.tsx — shared by the overview and the full pages
+│                   RouteErrorBoundary.tsx — reconnect on transport failures, explain refusals
 ├─ utils/           route-errors.ts — which route errors are transient
 ├─ routes/
 │  ├─ webhooks.orders.paid.tsx   verify → record → enqueue → 200
 │  ├─ simulated-engine.commissions.tsx   the stand-in commission engine (bearer auth, JSON)
 │  ├─ app.activity.tsx           JSON the dashboard polls (orders, jobs, syncs)
 │  ├─ api.referral.validate.tsx  answers the checkout extension (session-token auth, CORS)
-│  ├─ app._index.tsx             dashboard (loader/action, Polaris web components)
+│  ├─ app._index.tsx             overview (loader/action, Polaris web components)
+│  ├─ app.commissions.tsx        every commission, paged, filter by engine state, search by name/code/order
+│  ├─ app.deliveries.tsx         every webhook delivery, paged
 │  └─ webhooks.app.*.tsx         template lifecycle webhooks
 ├─ types/           orders-paid.ts — the slice of the webhook payload we depend on
 └─ shopify.server.ts, db.server.ts
