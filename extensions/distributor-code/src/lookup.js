@@ -70,3 +70,35 @@ export async function lookupReferralCode({
     return { status: "unavailable" };
   }
 }
+
+/** Pauses between attempts when the app does not answer. */
+export const RETRY_DELAYS_MS = [1500, 4000];
+
+/**
+ * `lookupReferralCode`, asked again when the app does not answer: a dev
+ * tunnel drops a request now and then, and one dropped request should not
+ * leave the banner without the distributor's name. A definite answer (valid
+ * or invalid) is returned at once; `isCancelled` stops the retries when the
+ * code changes or the extension goes away.
+ *
+ * @param {Parameters<typeof lookupReferralCode>[0]} input
+ * @param {{ delaysMs?: number[], sleep?: (ms: number) => Promise<void>, isCancelled?: () => boolean }} [options]
+ * @returns {Promise<LookupResult>}
+ */
+export async function lookupWithRetry(
+  input,
+  {
+    delaysMs = RETRY_DELAYS_MS,
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    isCancelled = () => false,
+  } = {},
+) {
+  let result = await lookupReferralCode(input);
+  for (const delay of delaysMs) {
+    if (result.status !== "unavailable" || isCancelled()) break;
+    await sleep(delay);
+    if (isCancelled()) break;
+    result = await lookupReferralCode(input);
+  }
+  return result;
+}

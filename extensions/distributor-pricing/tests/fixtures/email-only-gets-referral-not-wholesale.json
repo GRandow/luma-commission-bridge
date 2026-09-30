@@ -1,0 +1,97 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "attribute": {
+          "value": "ANA123"
+        },
+        "buyerIdentity": {
+          "isAuthenticated": false,
+          "customer": {
+            "metafield": {
+              "value": "gid://shopify/Metaobject/3"
+            }
+          }
+        },
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/0",
+            "cost": {
+              "subtotalAmount": {
+                "amount": "94.0"
+              }
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/1",
+            "cost": {
+              "subtotalAmount": {
+                "amount": "34.0"
+              }
+            }
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": ["PRODUCT"],
+        "metafield": {
+          "jsonValue": {
+            "version": 1,
+            "referralPercent": 10,
+            "wholesalePercent": 20,
+            "levelPercents": {
+              "team leader": 30
+            },
+            "distributors": [
+              {
+                "id": "gid://shopify/Metaobject/1",
+                "code": "ANA123",
+                "name": "Ana Souza",
+                "level": "Consultant"
+              },
+              {
+                "id": "gid://shopify/Metaobject/3",
+                "code": "LEAD001",
+                "name": "Carla Mendes",
+                "level": "Team leader"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "productDiscountsAdd": {
+            "candidates": [
+              {
+                "message": "Referred by Ana Souza: 10% off",
+                "targets": [
+                  {
+                    "cartLine": {
+                      "id": "gid://shopify/CartLine/0"
+                    }
+                  },
+                  {
+                    "cartLine": {
+                      "id": "gid://shopify/CartLine/1"
+                    }
+                  }
+                ],
+                "value": {
+                  "percentage": {
+                    "value": "10"
+                  }
+                }
+              }
+            ],
+            "selectionStrategy": "FIRST"
+          }
+        }
+      ]
+    }
+  }
+}

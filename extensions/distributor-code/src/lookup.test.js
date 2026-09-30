@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { lookupReferralCode, readCheckoutConfig } from "./lookup";
+import {
+  lookupReferralCode,
+  lookupWithRetry,
+  readCheckoutConfig,
+} from "./lookup";
 
 const config = {
   target: { type: "shop" },
@@ -90,5 +94,52 @@ describe("lookupReferralCode", () => {
         fetchImpl: vi.fn().mockRejectedValue(new TypeError("Failed to fetch")),
       }),
     ).resolves.toEqual({ status: "unavailable" });
+  });
+});
+
+describe("lookupWithRetry", () => {
+  const input = (fetchImpl) => ({
+    validateUrl: "https://app.example/api/referral/validate",
+    code: "ANA123",
+    getToken: () => Promise.resolve("token"),
+    fetchImpl,
+  });
+  const noWait = { sleep: () => Promise.resolve() };
+
+  it("asks again when the app does not answer, then takes the name", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ valid: true, name: "Ana Souza" })),
+      );
+    await expect(lookupWithRetry(input(fetchImpl), noWait)).resolves.toEqual({
+      status: "valid",
+      name: "Ana Souza",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns a definite answer at once", async () => {
+    const fetchImpl = answering(200, { valid: false });
+    await expect(lookupWithRetry(input(fetchImpl), noWait)).resolves.toEqual({
+      status: "invalid",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up after the last delay, and stops when cancelled", async () => {
+    const down = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    await expect(
+      lookupWithRetry(input(down), { ...noWait, delaysMs: [1, 1] }),
+    ).resolves.toEqual({ status: "unavailable" });
+    expect(down).toHaveBeenCalledTimes(3);
+
+    const cancelledDown = vi.fn().mockRejectedValue(new TypeError("x"));
+    await lookupWithRetry(input(cancelledDown), {
+      ...noWait,
+      isCancelled: () => true,
+    });
+    expect(cancelledDown).toHaveBeenCalledTimes(1);
   });
 });

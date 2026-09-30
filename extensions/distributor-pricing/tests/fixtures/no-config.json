@@ -1,0 +1,39 @@
+{
+  "payload": {
+    "export": "cart-lines-discounts-generate-run",
+    "target": "cart.lines.discounts.generate.run",
+    "input": {
+      "cart": {
+        "attribute": {
+          "value": "ANA123"
+        },
+        "buyerIdentity": null,
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/0",
+            "cost": {
+              "subtotalAmount": {
+                "amount": "94.0"
+              }
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/1",
+            "cost": {
+              "subtotalAmount": {
+                "amount": "34.0"
+              }
+            }
+          }
+        ]
+      },
+      "discount": {
+        "discountClasses": ["PRODUCT"],
+        "metafield": null
+      }
+    },
+    "output": {
+      "operations": []
+    }
+  }
+}

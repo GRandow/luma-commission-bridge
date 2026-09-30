@@ -1,0 +1,19 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "t:name"
+handle = "distributor-pricing"
+type = "function"
+uid = "b5503d24-e38c-c02e-706d-c2e272d1b68b26b88913"
+description = "t:description"
+
+  # Product discounts only: the app creates the discount with
+  # discountClasses = [PRODUCT], so no delivery target is needed.
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart-lines-discounts-generate-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"

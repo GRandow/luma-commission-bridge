@@ -13,6 +13,7 @@ import {
   CONFIG_KEY,
   CONFIG_NAMESPACE,
   lookupReferralCode,
+  lookupWithRetry,
   readCheckoutConfig,
 } from "./lookup";
 
@@ -51,19 +52,22 @@ function Extension() {
   /** What the app said about each code seen so far. */
   const [known, setKnown] = useState({});
 
-  const lookup = (code) =>
-    lookupReferralCode({
-      validateUrl: config?.validateUrl,
-      code,
-      getToken: () => sessionToken.get(),
-    });
+  const lookupInput = (code) => ({
+    validateUrl: config?.validateUrl,
+    code,
+    getToken: () => sessionToken.get(),
+  });
 
-  // A code that arrived on the cart (from the storefront's link) is looked
-  // up once, so the banner can name the distributor or flag a bad code.
+  // The code on the cart (from the storefront's link, or applied here) is
+  // looked up so the banner can name the distributor or flag a bad code. If
+  // the app does not answer it is asked again a couple of times; only then
+  // does the banner settle for the code alone.
   useEffect(() => {
     if (!currentCode || known[currentCode]) return;
     let cancelled = false;
-    lookup(currentCode).then((result) => {
+    lookupWithRetry(lookupInput(currentCode), {
+      isCancelled: () => cancelled,
+    }).then((result) => {
       if (!cancelled) setKnown((all) => ({ ...all, [currentCode]: result }));
     });
     return () => {
@@ -85,7 +89,7 @@ function Extension() {
       return;
     }
     setBusy(true);
-    const verdict = await lookup(code);
+    const verdict = await lookupReferralCode(lookupInput(code));
     if (verdict.status === "invalid") {
       setBusy(false);
       setError(t("notRecognized"));
@@ -106,7 +110,11 @@ function Extension() {
       setError(t("couldNotApply"));
       return;
     }
-    setKnown((all) => ({ ...all, [code]: verdict }));
+    // A code applied while the app was unreachable is left to the lookup
+    // above, which retries and fills in the name once the app answers.
+    if (verdict.status !== "unavailable") {
+      setKnown((all) => ({ ...all, [code]: verdict }));
+    }
     setInput("");
     setError(null);
   }

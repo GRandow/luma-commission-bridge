@@ -7,7 +7,9 @@ name = "luma-commission-bridge"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_orders,write_orders,write_metaobjects,write_metaobject_definitions,read_customers"
+# write_discounts: the automatic discount that runs the distributor-pricing Function.
+# write_customers: the pinned "Distributor" field on the customer page.
+scopes = "read_orders,write_orders,write_metaobjects,write_metaobject_definitions,read_customers,write_customers,write_discounts"
 
 # --- Custom data owned by the app (created by `shopify app deploy`) ---
 

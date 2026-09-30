@@ -6,9 +6,9 @@
 ![Prisma](https://img.shields.io/badge/Prisma-2D3748?logo=prisma)
 ![CI](https://github.com/GRandow/luma-commission-bridge/actions/workflows/ci.yml/badge.svg)
 
-A custom Shopify app that does the back-office side of a direct-sales store: it listens to `orders/paid` webhooks, attributes each order to the distributor who referred the shopper, calculates the commission, writes it back to the order and hands it to an external commission engine — with the retries, idempotency and visibility that money deserves. It is the merchant-side companion of [luma-shopify-storefront](https://github.com/GRandow/luma-shopify-storefront), the headless storefront that puts the distributor's code on the cart.
+A custom Shopify app that does the back-office side of a direct-sales store: it listens to `orders/paid` webhooks, attributes each order to the distributor who referred the shopper, calculates the commission, writes it back to the order and hands it to an external commission engine — with the retries, idempotency and visibility that money deserves. At checkout, a Shopify Function prices the cart for referred shoppers and for distributors themselves. It is the merchant-side companion of [luma-shopify-storefront](https://github.com/GRandow/luma-shopify-storefront), the headless storefront that puts the distributor's code on the cart.
 
-> **Status:** parts 1–3 are done — webhook intake, idempotent processing, distributor metaobjects, per-distributor rates, write-back to the order, sync to the commission engine with retries, admin dashboard — and the checkout UI extension of part 4 is in. The Shopify Function for distributor pricing is next (see _Roadmap_).
+> **Status:** parts 1–5 are done — webhook intake, idempotent processing, distributor metaobjects, per-distributor rates, write-back to the order, sync to the commission engine with retries, admin dashboard, the checkout UI extension that collects the code, and the Shopify Function that applies distributor pricing. Next ideas are under _Roadmap_.
 
 ## How it works
 
@@ -29,6 +29,13 @@ checkout    code typed in the checkout UI extension  ─┘
                                                                               ▼
   admin page (Polaris web components): commissions with their engine state, distributors, deliveries,
                                        reprocess / retry / sync buttons, simulator switch (normal · outage · rejecting)
+
+  pricing (at checkout, before payment)
+  pricing page ─ percentages + active distributors ─► JSON metafield on the app's automatic discount
+  cart changes ─► distributor-pricing Function (Wasm, runs inside Shopify) reads:
+         the "ref" attribute (referred shopper → referral discount)
+         the signed-in customer's $app:distributor field (distributor → wholesale by level)
+         ─ larger discount wins, never stacked ─ one product discount on every line
 ```
 
 ## Decisions worth reading
@@ -45,18 +52,21 @@ checkout    code typed in the checkout UI extension  ─┘
 - **Two kinds of failure, two behaviours.** A 5xx or a network error is retried with exponential backoff; a 4xx means the payload is the problem, so the sync stops, the reason is shown on the dashboard, and a person decides (there is a _Retry_ button once the cause is fixed). Every attempt is counted on the row.
 - **The dashboard survives a flaky path.** A dev tunnel drops requests now and then, and a page that polls every five seconds meets every drop. The live parts (orders, jobs, syncs) are polled as JSON with a plain `fetch`, so a failed poll keeps the last good data on screen; a request that dies in transit (5xx, timeout, DNS) shows "Reconnecting" and reloads itself; and a refusal (401, 403) is shown with its status and likely cause instead of a blank error. Auth redirects still go through Shopify's own boundary.
 - **The overview stays short; the ledger has its own pages.** A real store's tables only grow, so the dashboard shows the latest eight commissions and five deliveries and links to full pages (`/app/commissions`, `/app/deliveries`) that are paged from the database, 15 rows at a time, newest first. The commissions page can be narrowed to one engine state (_Failed_ is the one an operator reaches for) and searched by distributor name, referral code or order number as you type; both live in the URL, so a filtered view can be shared. Retry, Sync and Reprocess work from every page; they post to the same action, so the behaviour cannot drift between the overview and the full list.
+- **Pricing runs inside Shopify, so the app ships its data to it.** The discount is a Shopify Function (`extensions/distributor-pricing`, the Discount API's `cart.lines.discounts.generate.run` target): Shopify runs it as WebAssembly on every cart change, with no call to our server in the checkout's critical path — and it cannot make one or read metaobjects. So the app writes everything the decision needs into an app-owned JSON metafield on its automatic discount: the merchant's percentages (a default referral rate plus each distributor's own, keyed by metaobject id so a changed code keeps its rate; wholesale by level) and the active distributors (id, code, name, level). The pricing page and the overview re-copy the distributors whenever they open, so a deactivated distributor stops earning anyone a discount; a metaobject webhook would make that immediate in production. The Function's input is only what it reads: the `ref` attribute, whether the buyer signed in and the customer's `$app:distributor` field, the lines and the config.
+- **A distributor is a customer who points at their record.** Wholesale needs to know which customer _is_ a distributor. Instead of copying the level onto the customer (two places to keep in sync), the app adds a pinned `Distributor` field to the customer page, a `metaobject_reference` to the `$app:distributor` entry; the Function looks that id up in the config, so the level and the active flag stay on the distributor record only. Wholesale waits for a signed-in buyer (`buyerIdentity.isAuthenticated`): Shopify matches a typed email to its customer before any sign-in, so without that check anyone could type a distributor's email and pay wholesale. Referral and wholesale never stack — the larger wins — and a distributor cannot claim the referral discount with their own code. Commissions are still calculated on the discounted subtotal, so a referral discount lowers the commission base, as it should.
 - **Queue in process, on purpose.** One dev store, one Node process: an in-process queue is enough and keeps the demo self-contained. The queue has a tiny interface so SQS or BullMQ can replace it without touching the handlers; persisted deliveries already make unfinished work re-runnable after a restart.
 
 ## Stack
 
-React Router 7 (server and admin UI in one project) · `@shopify/shopify-app-react-router` (token exchange, session storage, webhook verification) · Admin GraphQL API 2026-07 · Prisma + Postgres (Neon) · Polaris web components + App Bridge · Vitest · GitHub Actions
+React Router 7 (server and admin UI in one project) · `@shopify/shopify-app-react-router` (token exchange, session storage, webhook verification) · Admin GraphQL API 2026-07 · Shopify Functions (Discount API, TypeScript → Wasm) · checkout UI extensions (Preact) · Prisma + Postgres (Neon) · Polaris web components + App Bridge · Vitest · GitHub Actions
 
 ## Project layout
 
 ```
 app/
 ├─ domain/          money.ts (cents) · rates.ts (basis points) · attribution.ts (referral code) · commission.ts
-│                   resolve-commission.ts (which rate and status apply) · paging.ts (page size, clamping, filters) — pure, unit-tested
+│                   resolve-commission.ts (which rate and status apply) · paging.ts (page size, clamping, filters)
+│                   pricing.ts (the pricing settings and the config the Function reads) — pure, unit-tested
 ├─ services/        job-queue.server.ts · webhook-events.server.ts (idempotent intake) · commissions.server.ts (pipeline)
 │                   distributors.server.ts (metaobjects) · order-writeback.server.ts (metafieldsSet + tagsAdd)
 │                   commission-engine.server.ts (client) · commission-sync.server.ts (sync job) · simulated-engine.server.ts
@@ -64,6 +74,7 @@ app/
 │                   retention.server.ts (30-day purge of payloads, delete-everything on uninstall)
 │                   dashboard.server.ts (the overview's latest rows, shared with its JSON poll · the paged full tables)
 │                   referral-validation.server.ts (code → active distributor?) · checkout-config.server.ts (the app's URL, as a shop metafield)
+│                   pricing.server.ts (the automatic discount and its config) · customer-link.server.ts (the customer's Distributor field)
 ├─ components/      CommissionsTable.tsx · DeliveriesTable.tsx · Pagination.tsx · NoWrap.tsx — shared by the overview and the full pages
 │                   RouteErrorBoundary.tsx — reconnect on transport failures, explain refusals
 ├─ utils/           route-errors.ts — which route errors are transient
@@ -75,13 +86,17 @@ app/
 │  ├─ app._index.tsx             overview (loader/action, Polaris web components)
 │  ├─ app.commissions.tsx        every commission, paged, filter by engine state, search by name/code/order
 │  ├─ app.deliveries.tsx         every webhook delivery, paged
+│  ├─ app.pricing.tsx            referral and wholesale percentages, who gets what, creates/updates the discount
 │  └─ webhooks.app.*.tsx         template lifecycle webhooks
 ├─ types/           orders-paid.ts — the slice of the webhook payload we depend on
 └─ shopify.server.ts, db.server.ts
 prisma/             schema.prisma (Session, WebhookEvent, Commission) and migrations
 extensions/
-└─ distributor-code/ checkout UI extension (Preact + Polaris web components): the code field in the checkout,
-                    checked with the app before it is applied, writing the same `ref` attribute; unit-tested
+├─ distributor-code/ checkout UI extension (Preact + Polaris web components): the code field in the checkout,
+│                   checked with the app before it is applied, writing the same `ref` attribute; unit-tested
+└─ distributor-pricing/ Shopify Function (TypeScript → Wasm), Discount API: src/pricing.ts decides, the entry point
+                    turns the decision into a product discount; unit tests + fixtures run through the source in CI
+                    and through the compiled Wasm with `npm test -w distributor-pricing`
 ```
 
 ## Running it
@@ -95,8 +110,10 @@ npm run dev        # shopify app dev: tunnel, app install, Prisma migrations, ho
 
 `shopify app dev` registers the `orders/paid` subscription from `shopify.app.toml` against the tunnel URL and serves the checkout extension into the store's checkout (open it from the Dev Console's preview link). The distributor metaobject definition in the same file is created by `shopify app deploy`, which you run once (and again whenever it changes). Then, on the app's home page, set up the order metafields (one click, creates the app's pinned definitions), seed the sample distributors, place a test order on the storefront (Bogus Gateway, card `1`) with a `?ref=ANA123` link, and the order shows up with its commission within seconds — and in the Shopify admin the order carries the commission metafields and the `ref:ANA123` tag. To rehearse a failure, switch the simulator to _Outage_ in the Commission engine card, place another order and watch the Engine column retry and fail; switch back to _Normal_ and click _Retry_.
 
+For pricing, open **Pricing**, set the percentages and click _Save and go live_: the app creates the automatic discount and the customer _Distributor_ field. A cart opened from a `?ref=ANA123` link now shows the referral discount. For wholesale, open a customer in the admin, set _Distributor_ to their record, and sign in as that customer at checkout.
+
 ```bash
-npm test           # Vitest: domain rules, the pipeline, the engine client, the sync job, the simulator, the extension's code rules
+npm test           # Vitest: domain rules, the pipeline, the engine client, the sync job, the simulator, both extensions
 npm run typecheck  # react-router typegen + tsc
 npm run lint
 ```
@@ -128,7 +145,7 @@ The checkout extension needs no configuration of its own: the dashboard writes t
 
 ## Scopes
 
-`read_orders` (webhook and order lookups), `write_orders` (commission metafields and tag on the order), `write_metaobjects` and `write_metaobject_definitions` (distributor records and their definition), `read_customers` (reserved for a sponsor-code fallback). The commission flow reads no customer field: attribution comes from the order's note attributes, not from the customer. The protected-customer-data approval described above is needed only because `orders/*` webhooks require it.
+`read_orders` (webhook and order lookups), `write_orders` (commission metafields and tag on the order), `write_metaobjects` and `write_metaobject_definitions` (distributor records and their definition), `read_customers` and `write_customers` (the pinned _Distributor_ field on customers, which the merchant fills in), `write_discounts` (the automatic discount that runs the pricing Function). The commission flow reads no customer field: attribution comes from the order's note attributes, not from the customer; the Function reads one app-owned customer metafield and nothing personal. The protected-customer-data approval described above is needed only because `orders/*` webhooks require it.
 
 ## Roadmap
 
@@ -136,4 +153,5 @@ The checkout extension needs no configuration of its own: the dashboard writes t
 2. ~~Distributors as metaobjects (code, name, level, rate), attribution by code, write-back with `metafieldsSet` and `tagsAdd`~~
 3. ~~Sync to an external commission engine (simulated endpoint) with retries, status and manual retry~~
 4. ~~Checkout UI extension that collects the referral code at checkout~~ — done: `extensions/distributor-code`
-5. Shopify Function for distributor pricing (wholesale by distributor level, referral discount), created from the dashboard with `discountAutomaticAppCreate`
+5. ~~Shopify Function for distributor pricing (wholesale by distributor level, referral discount), created from the dashboard with `discountAutomaticAppCreate`~~ — done: `extensions/distributor-pricing`
+6. `metaobjects/update` webhook to re-sync the pricing config the moment a distributor changes; theme app extension for stores on Liquid themes; nightly reconciliation of commissions against paid orders

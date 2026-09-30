@@ -1,0 +1,34 @@
+# What the pricing decision needs, and nothing else: the referral code on the
+# cart, the distributor the customer is linked to and whether they actually
+# signed in, the lines to discount, and the app's config on the discount.
+# `metafield` without a namespace reads the app-reserved one ($app), which
+# only this app writes.
+query CartInput {
+  cart {
+    attribute(key: "ref") {
+      value
+    }
+    buyerIdentity {
+      isAuthenticated
+      customer {
+        metafield(key: "distributor") {
+          value
+        }
+      }
+    }
+    lines {
+      id
+      cost {
+        subtotalAmount {
+          amount
+        }
+      }
+    }
+  }
+  discount {
+    discountClasses
+    metafield(key: "pricing_config") {
+      jsonValue
+    }
+  }
+}
