@@ -12,6 +12,7 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { formatRate } from "../domain/commission";
 import { formatCents } from "../domain/money";
+import { ensureCheckoutConfig } from "../services/checkout-config.server";
 import { getEngineConfig } from "../services/commission-engine.server";
 import { enqueueCommissionSync } from "../services/commission-sync.server";
 import { enqueueOrderProcessing } from "../services/commissions.server";
@@ -48,8 +49,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
   await purgeOldWebhookEventsIfDue();
-  const [activity, distributors, definitions] = await Promise.all([
+  const [activity, , distributors, definitions] = await Promise.all([
     loadDashboardActivity(shop),
+    // Keeps the checkout extension pointed at this app (the tunnel URL
+    // changes in development); a failure here must not break the page.
+    // eslint-disable-next-line no-undef
+    ensureCheckoutConfig(admin, process.env.SHOPIFY_APP_URL ?? "").catch(
+      (error: unknown) => {
+        console.error("[checkout-config] could not sync", error);
+        return "unchanged" as const;
+      },
+    ),
     listDistributors(admin).catch((error: unknown) => {
       // The metaobject definition is created by `shopify app deploy`/`dev`;
       // until then the query fails and the section explains what to do.

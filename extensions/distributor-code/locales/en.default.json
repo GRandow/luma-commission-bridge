@@ -1,0 +1,15 @@
+{
+  "heading": "Distributor code",
+  "help": "Shopping with a distributor? Enter their code and this order is credited to them.",
+  "label": "Distributor code",
+  "apply": "Apply",
+  "remove": "Remove",
+  "referredBy": "Referred by {{code}}",
+  "referredByName": "Referred by {{name}} ({{code}})",
+  "creditNotice": "This order will be credited to them.",
+  "unknownCodeHeading": "We don't recognize the code {{code}}",
+  "unknownCodeHelp": "Check it with your distributor, or remove it to continue without a referral.",
+  "invalid": "Codes have 2 to 32 letters or numbers (dashes and underscores are fine).",
+  "notRecognized": "We don't recognize this code. Check it with your distributor.",
+  "couldNotApply": "The code could not be saved. Please try again."
+}

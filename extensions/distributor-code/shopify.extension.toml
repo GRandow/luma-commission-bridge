@@ -1,0 +1,32 @@
+# Checkout UI extension: lets the shopper enter a distributor code inside
+# Shopify's checkout. It writes the same `ref` cart attribute the storefront
+# uses, so the webhook, the app and the dashboard need no change.
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration
+
+api_version = "2026-07"
+
+[[extensions]]
+name = "distributor-code"
+handle = "distributor-code"
+type = "ui_extension"
+uid = "9bbe58e1-1896-2e88-9ff0-3c2648b93013db2d837d"
+
+# A block target: the merchant places it in the checkout editor, typically
+# next to the discount code field. `shopify app dev` renders it in the
+# checkout preview without any placement.
+[[extensions.targeting]]
+module = "./src/Checkout.jsx"
+target = "purchase.checkout.block.render"
+
+# The app leaves its own address in this shop metafield (it is served by
+# Shopify and would not know where the app runs otherwise). The extension
+# reads it to ask the app whether a code belongs to an active distributor.
+[[extensions.metafields]]
+namespace = "$app"
+key = "checkout_api"
+
+[extensions.capabilities]
+# Only `fetch()` to the app, authenticated with the session token Shopify
+# issues to the extension; no Storefront API access is needed.
+network_access = true
+api_access = false
